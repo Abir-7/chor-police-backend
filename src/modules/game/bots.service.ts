@@ -98,6 +98,8 @@ export class BotService {
   private readonly scheduledActions = new Map<string, Set<string>>();
   /** Makes every spontaneous reaction timer key unique. */
   private reactionSequence = 0;
+  /** Rooms where a human is disconnected: bots must not advance the game. */
+  private readonly pausedRooms = new Set<string>();
 
   setServer(server: Server): void {
     this.server = server;
@@ -107,8 +109,24 @@ export class BotService {
     this.handlers = handlers;
   }
 
+  /** A human dropped out: freeze every pending bot action in the room. */
+  pause(roomCode: string): void {
+    this.pausedRooms.add(roomCode);
+    this.clearTimers(roomCode);
+  }
+
+  /** Everyone is back: re-schedule whatever the bots still owe. */
+  resume(roomCode: string): void {
+    if (!this.pausedRooms.delete(roomCode)) {
+      return;
+    }
+
+    this.scheduleTurns(roomCode);
+  }
+
   /** Called when a fresh round/match starts: reset timers, kick bot turns off. */
   onRoundStarted(roomCode: string): void {
+    this.pausedRooms.delete(roomCode);
     this.clearTimers(roomCode);
     this.scheduleTurns(roomCode);
     this.scheduleRoundStartReaction(roomCode);
@@ -589,6 +607,11 @@ export class BotService {
     delayMs: number,
     callback: () => void,
   ): void {
+    // Frozen while a human is away; resume() re-schedules from game state.
+    if (this.pausedRooms.has(roomCode)) {
+      return;
+    }
+
     const key = `${roomCode}:${action}`;
 
     let roomKeys = this.scheduledActions.get(roomCode);

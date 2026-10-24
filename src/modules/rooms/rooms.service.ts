@@ -41,6 +41,9 @@ export class RoomsService {
   private onRoomPlayersChanged?: (roomCode: string) => void;
   private onPlayerReconnected?: (roomCode: string, playerId: string) => void;
   private onPlayerTimedOut?: (roomCode: string, playerName: string) => void;
+  private onPlayerDisconnected?: (roomCode: string, playerId: string) => void;
+  // `${roomCode}:${playerId}` -> epoch ms when the held seat is released
+  private readonly disconnectDeadlines = new Map<string, number>();
   // Reconnect token -> player ID
   private readonly reconnectTokens = new Map<string, string>();
 
@@ -64,6 +67,39 @@ export class RoomsService {
 
   setPlayerReconnectedHandler(handler: (roomCode: string, playerId: string) => void): void {
     this.onPlayerReconnected = handler;
+  }
+
+  setPlayerDisconnectedHandler(
+    handler: (roomCode: string, playerId: string) => void,
+  ): void {
+    this.onPlayerDisconnected = handler;
+  }
+
+  /** Humans whose seat is currently held open (socket gone, not yet released). */
+  getDisconnectedHumans(
+    roomCode: string,
+  ): { id: string; name: string; remainingMs: number | null }[] {
+    const room = this.rooms.get(roomCode);
+
+    if (!room) {
+      return [];
+    }
+
+    return room.players
+      .filter((player) => !player.isBot && !player.isConnected)
+      .map((player) => {
+        const deadline = this.disconnectDeadlines.get(
+          this.getPlayerKey(roomCode, player.id),
+        );
+
+        // Relative time, so client/server clock skew cannot skew the countdown.
+        return {
+          id: player.id,
+          name: player.name,
+          remainingMs:
+            deadline === undefined ? null : Math.max(0, deadline - Date.now()),
+        };
+      });
   }
 
   setPlayerTimedOutHandler(
@@ -300,6 +336,7 @@ export class RoomsService {
     player.isConnected = false;
 
     this.scheduleDisconnectTimeout(roomCode, playerId);
+    this.onPlayerDisconnected?.(roomCode, playerId);
 
     return room;
   }
@@ -344,8 +381,8 @@ export class RoomsService {
       throw new NotFoundException('Player does not belong to this room.');
     }
 
-    this.revokeReconnectToken(playerId);
-
+    // Token stays stable across reconnects: if the reply is lost because the
+    // connection drops again, the saved token must still work next time.
     const newReconnectToken = this.issueReconnectToken(playerId);
 
     this.cancelDisconnectTimeout(roomCode, playerId);
@@ -451,6 +488,7 @@ export class RoomsService {
 
     const timer = setTimeout(() => {
       this.disconnectTimers.delete(key);
+      this.disconnectDeadlines.delete(key);
 
       const room = this.rooms.get(roomCode);
       const player = room?.players.find((item) => item.id === playerId);
@@ -470,6 +508,7 @@ export class RoomsService {
     timer.unref?.();
 
     this.disconnectTimers.set(key, timer);
+    this.disconnectDeadlines.set(key, Date.now() + DISCONNECT_GRACE_MS);
   }
 
   private cancelDisconnectTimeout(roomCode: string, playerId: string): void {
@@ -480,6 +519,8 @@ export class RoomsService {
       clearTimeout(timer);
       this.disconnectTimers.delete(key);
     }
+
+    this.disconnectDeadlines.delete(key);
   }
 
   private getPlayerKey(roomCode: string, playerId: string): string {
@@ -510,7 +551,7 @@ export class RoomsService {
     const previousToken = this.playerReconnectTokens.get(playerId);
 
     if (previousToken) {
-      this.reconnectTokens.delete(previousToken);
+      return previousToken;
     }
 
     const token = randomUUID();

@@ -26,7 +26,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
-  private readonly activeSocketIds = new Map<string, string>();  constructor(private readonly roomsService: RoomsService) {
+  private readonly activeSocketIds = new Map<string, string>();
+
+  constructor(private readonly roomsService: RoomsService) {
     // A seat that stays empty past the grace period is released so the
     // remaining players are not blocked by a player who never returns.
     this.roomsService.setPlayerTimedOutHandler(
@@ -79,6 +81,16 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     } catch (error: unknown) {
       console.error('Failed to update disconnected player:', error);
     }
+  }
+
+  /**
+   * Liveness probe. A phone that was locked can hold a "connected" socket that
+   * is really dead; the client pings with an ack timeout on resume and
+   * redials when this never answers.
+   */
+  @SubscribeMessage('app:ping')
+  handlePing(): { ok: true; at: number } {
+    return { ok: true, at: Date.now() };
   }
 
   @SubscribeMessage('room:create')
@@ -162,10 +174,10 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     },
   ): void {
     try {
-      this.ensureNotInRoom(client);
-
       const { room, player, reconnectToken } =
         this.roomsService.reconnectPlayer(body?.roomCode, body?.reconnectToken);
+
+      this.ensureSameSeat(client, player.id);
 
       void client.join(room.code);
       this.registerPlayerSocket(client, room.code, player.id);
@@ -202,13 +214,13 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() body: ReclaimSeatPayload,
   ): void {
     try {
-      this.ensureNotInRoom(client);
-
       const { room, player, reconnectToken } = this.roomsService.reclaimSeat(
         body?.roomCode,
         body?.playerName,
         body?.seatPin,
       );
+
+      this.ensureSameSeat(client, player.id);
 
       void client.join(room.code);
       this.registerPlayerSocket(client, room.code, player.id);
@@ -385,12 +397,37 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
   }
 
+  /** A reconnect may repeat on the same socket, but never switch seats. */
+  private ensureSameSeat(client: Socket, playerId: string): void {
+    if (client.data.playerId && client.data.playerId !== playerId) {
+      throw new Error('You are already in a room.');
+    }
+  }
+
   private registerPlayerSocket(
     client: Socket,
     roomCode: string,
     playerId: string,
   ): void {
     const playerKey = this.getPlayerKey(roomCode, playerId);
+
+    // Same seat opened from a second tab/device (or a refresh that beat the
+    // server's disconnect detection): the newest socket wins and the old one
+    // is detached, so game lookups can never land on the stale socket.
+    const previousSocketId = this.activeSocketIds.get(playerKey);
+
+    if (previousSocketId && previousSocketId !== client.id) {
+      const previous = this.server.sockets.sockets.get(previousSocketId);
+
+      if (previous) {
+        delete previous.data.roomCode;
+        delete previous.data.playerId;
+        void previous.leave(roomCode);
+        previous.emit('room:replaced', {
+          message: 'This seat was opened in another tab or device.',
+        });
+      }
+    }
 
     this.activeSocketIds.set(playerKey, client.id);
 

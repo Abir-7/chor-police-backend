@@ -78,6 +78,10 @@ export class GameGateway
       return this.gameService.getGameState(roomCode) !== undefined;
     });
 
+    this.roomsService.setPlayerDisconnectedHandler((roomCode: string) => {
+      this.syncPauseState(roomCode);
+    });
+
     this.roomsService.setPlayerReconnectedHandler(
       (roomCode: string, playerId: string) => {
         this.handlePlayerReconnectedGameSync(roomCode, playerId);
@@ -510,49 +514,87 @@ export class GameGateway
     this.processPoliceGuess(roomCode, botId, selectedPlayerId);
   }
 
+  /**
+   * Sends one atomic snapshot (state + this player's private role + pause
+   * info) to a returning socket. The client replaces its whole game view with
+   * it and skips every animation, so a refresh lands on the live board.
+   */
   private handlePlayerReconnectedGameSync(
     roomCode: string,
     playerId: string,
   ): void {
-    const game = this.gameService.getGameState(roomCode);
-    if (!game) {
-      return;
-    }
-
     const socket = this.findSocketByPlayerId(roomCode, playerId);
+
     if (!socket) {
       return;
     }
 
-    // Also emit game:started so the frontend transitions from WaitingRoom to GameBoard
-    socket.emit('game:started', this.gameService.getPublicGameState(roomCode));
+    const game = this.gameService.getGameState(roomCode);
 
-    // Send public game state
-    socket.emit(
-      'game:state-updated',
-      this.gameService.getPublicGameState(roomCode),
-    );
+    if (!game) {
+      // The match ended/aborted while this player was away: tell the client
+      // to drop any stale board instead of leaving it frozen on old state.
+      socket.emit('game:resync', { gameState: null, disconnected: [] });
+      return;
+    }
 
-    // If role reveal or later, resend private role to reconnected player
-    if (
-      game.phase === GamePhase.ROLE_REVEAL ||
-      game.phase === GamePhase.GUESSING ||
-      game.phase === GamePhase.ROUND_RESULT ||
-      game.phase === GamePhase.GAME_OVER
-    ) {
-      const player = game.players.find((p) => p.id === playerId);
-      if (player?.role) {
-        const chorPlayer = game.players.find((p) => p.role === GameRole.CHOR);
+    const player = game.players.find((p) => p.id === playerId);
+    let myRole: GameRole | undefined;
+    let partnerThief: { id: string; name: string; role: GameRole } | undefined;
+
+    // Roles exist from ROLE_REVEAL onward; before that there is nothing private.
+    if (player?.role && game.phase !== GamePhase.PICKING) {
+      myRole = player.role;
+
+      const chorPlayer = game.players.find((p) => p.role === GameRole.CHOR);
       const dakatPlayer = game.players.find((p) => p.role === GameRole.DAKAT);
-      let partnerThief: { id: string; name: string; role: GameRole } | undefined;
+
       if (player.role === GameRole.CHOR && dakatPlayer) {
-        partnerThief = { id: dakatPlayer.id, name: dakatPlayer.name, role: GameRole.DAKAT };
+        partnerThief = {
+          id: dakatPlayer.id,
+          name: dakatPlayer.name,
+          role: GameRole.DAKAT,
+        };
       } else if (player.role === GameRole.DAKAT && chorPlayer) {
-        partnerThief = { id: chorPlayer.id, name: chorPlayer.name, role: GameRole.CHOR };
-      }
-      socket.emit('game:my-role', { role: player.role, partnerThief });
+        partnerThief = {
+          id: chorPlayer.id,
+          name: chorPlayer.name,
+          role: GameRole.CHOR,
+        };
       }
     }
+
+    socket.emit('game:resync', {
+      gameState: this.gameService.getPublicGameState(roomCode),
+      myRole,
+      partnerThief,
+      disconnected: this.roomsService.getDisconnectedHumans(roomCode),
+    });
+
+    // Everyone else learns whether the table can carry on now.
+    this.syncPauseState(roomCode);
+  }
+
+  /**
+   * While a human seat is held open the round is frozen: their actions cannot
+   * be taken and bots must not play on without them. Tell the room who we are
+   * waiting for (and until when), or that play resumed.
+   */
+  private syncPauseState(roomCode: string): void {
+    if (!this.gameService.getGameState(roomCode)) {
+      return;
+    }
+
+    const disconnected = this.roomsService.getDisconnectedHumans(roomCode);
+
+    if (disconnected.length > 0) {
+      this.botService.pause(roomCode);
+      this.server.to(roomCode).emit('game:paused', { disconnected });
+      return;
+    }
+
+    this.server.to(roomCode).emit('game:resumed', {});
+    this.botService.resume(roomCode);
   }
 
   private emitPrivateRoles(roomCode: string): void {
@@ -614,6 +656,7 @@ export class GameGateway
   ): Socket | undefined {
     return [...this.server.sockets.sockets.values()].find(
       (socket) =>
+        socket.connected &&
         socket.data.roomCode === roomCode &&
         socket.data.playerId === playerId &&
         socket.rooms.has(roomCode),
